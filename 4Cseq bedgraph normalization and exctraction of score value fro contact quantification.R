@@ -1,0 +1,213 @@
+library("rtracklayer")
+library("GenomicRanges")
+library("ggplot2")
+library(dplyr)
+
+
+## define regions to estimate background and the exluded proximity region
+background_3=GRanges(seqnames=Rle("chr1"), ranges=IRanges(start=103760001, end=110040000))# region corresponding to 3 consecutive TADs located on 3' of the region to be quantified
+background_5=GRanges(seqnames=Rle("chr1"), ranges=IRanges(start=93920001, end=96880000))# region corresponding to 3 consecutive TADs located on 5' of the region to be quantified
+Target_region=GRanges(seqnames=Rle("chr1"), ranges=IRanges(start=96960001, end=103600000))# reference TAD based on the dataset
+exluded_reg=GRanges(seqnames=Rle("chr1"), ranges=IRanges(start=100245000, end=100256300))# region were proximity effects are too high (defined arbitrary based on plot)
+
+Background_tot=c(background_3, background_5)
+Target_seq=GenomicRanges::setdiff(Target_region, exluded_reg)
+
+## Imprt bedgraph files into a granges list
+# Define directory and files
+bedgraph_dir <- choose.dir()
+bedgraph_files <- list.files(bedgraph_dir, pattern = "\\.bedgraph$", full.names = TRUE)
+bedgraph_files
+
+# Import each BEDGraph file into a GRanges object and store in a list
+granges_list <- lapply(bedgraph_files, function(file) {
+  import(file, format = "BEDGraph")
+})
+# Assign names to the list based on the file names
+names(granges_list) <- gsub("_1.bedgraph","" ,basename(bedgraph_files))
+granges_list
+
+granges_list <- lapply(granges_list, function(gr) {
+  resize(gr, width(gr) + 50, fix = "start")
+})
+
+### normalize GRanges objects
+# Function to normalize GRanges objects
+normalize_granges <- function(gr_obj, background_reg=Background_tot, reg_to_norm=Target_seq) {
+  # Step 1: Calculate background cutoff and quantify max scores
+  backgr_cutoff =subsetByOverlaps(gr_obj, background_reg)$score
+  backgr_cutoff<-backgr_cutoff[backgr_cutoff<= quantile(backgr_cutoff, 0.90)]
+  backgr_cutoff=max(backgr_cutoff)
+  print(paste0("the background value for the dataset ", deparse(substitute(gr_obj)), "is ", backgr_cutoff))
+
+  # Step 2: Subset the GRanges object based on overlaps with target sequence
+  gr_norm <- subsetByOverlaps(gr_obj, reg_to_norm)
+  
+  # Step 3: Normalize scores by subtracting the background value
+  gr_norm$score <- gr_norm$score - backgr_cutoff
+  
+  # Step 4: Replace negative scores with 0
+  gr_norm$score[gr_norm$score < 0] <- 0
+  
+  # Step 5: Calculate total signal after background normalization
+  total_signal <- sum(gr_norm$score)
+  print(paste0("the total signal value for the dataset ", deparse(substitute(gr_obj)), "is ", total_signal))
+  # Step 6: Normalize scores as a percentage of the total signal
+  gr_norm$score <- gr_norm$score / total_signal * 100
+  gr_norm$cum_score=cumsum(gr_norm$score)
+  
+  return(gr_norm)
+}
+
+
+# Apply the normalization function to each GRanges object in the list
+normalized_granges_list <- lapply(granges_list, normalize_granges,
+                                  background_reg=Background_tot, 
+                                  reg_to_norm=Target_seq)
+
+
+
+### Export the normalized files
+
+output_dir=choose.dir()
+
+# Function to export a GRanges object to a BEDGraph file with a track header
+export_granges<- function(gr_obj, file_name, output_dir, 
+                                                   track_height = "80", 
+                                                   view_limits = "0:0.1")
+  {
+  # Create the full path for the output file
+  output_file <- file.path(output_dir, paste0(file_name, "_norm.bedgraph"))
+  
+  # Create the track header line with additional details, including maxHeightPixels, viewLimits, and scale
+  header <- paste0("track type=bedGraph name=\"", file_name, 
+                   "\" visibility=full autoScale=off graphType=bar ",
+                   "windowingFunction=maximum smoothingWindow=4 ",
+                   "maxHeightPixels=", track_height, " viewLimits=", view_limits
+                   )
+  # Open the file for writing
+  file_conn <- file(output_file, "w")
+  
+  # Write the track header
+  writeLines(header, con = file_conn)
+  
+  # Export the GRanges object as BEDGraph, appending to the file after the header
+  rtracklayer::export(gr_obj, file_conn, format = "BEDGraph")
+  
+  # Close the file
+  close(file_conn)
+  
+  message("Exported: ", output_file)
+}
+
+# Apply the export function to each GRanges object in the list, including a track header
+lapply(names(normalized_granges_list), function(file_name) {
+  gr_obj <- normalized_granges_list[[file_name]]
+  export_granges(gr_obj, file_name, output_dir)
+})
+
+
+### extract score information for regions of interest
+
+# Function to extract relevant data from a GRanges object
+extract_data2 <- function(gr_obj, file_name) {
+  data.frame(
+    end = end(gr_obj),         # X-axis: end coordinate of the intervals
+    score = gr_obj$score,      # Y-axis: normalized score
+    file = file_name           # File name to differentiate between files
+  )
+}
+df<- do.call(rbind, lapply(names(normalized_granges_list), function(file_name) {
+  gr_obj <- normalized_granges_list[[file_name]]
+  extract_data2(gr_obj, file_name)
+}))
+
+
+
+#
+distal_reg_data1=df[which(df$end> 100027007 & df$end< 100142095),]
+
+df_distal_reg_data1=data.frame(Coord=distal_reg_data1[which(grepl("Ct1_DBT_1", distal_reg_data1$file)),1],
+                            Ctrl1_rep1=distal_reg_data1[which(grepl("Ct1_DBT_1", distal_reg_data1$file)), 2], 
+                            Ctrl1_rep2=distal_reg_data1[which(grepl("Ct1_DBT_2", distal_reg_data1$file)), 2],
+                            Ctrl2_rep1=distal_reg_data1[which(grepl("Ct2_DBT_1", distal_reg_data1$file)), 2],
+                            Ctrl2_rep2=distal_reg_data1[which(grepl("Ct2_DBT_2", distal_reg_data1$file)), 2],
+                            Pat1_rep1=distal_reg_data1[which(grepl("Pt1_DBT_1", distal_reg_data1$file)), 2],
+                            Pat1_rep2=distal_reg_data1[which(grepl("Pt1_DBT_2", distal_reg_data1$file)), 2],
+                            Pat2_rep1=distal_reg_data1[which(grepl("Pt2_DBT_1", distal_reg_data1$file)), 2],
+                            Pat2_rep2=distal_reg_data1[which(grepl("Pt2_DBT_2", distal_reg_data1$file)),2]
+                            )
+
+write.table(df_distal_reg_data1, file = "DBT_distal_reg1.txt", append = FALSE, quote = FALSE, sep = "\t",
+            row.names = FALSE,
+            col.names = TRUE)
+#
+distal_reg_data2=df[which(df$end> 100141977 & df$end< 100245119),]
+
+df_distal_reg_data2=data.frame(Coord=distal_reg_data2[which(grepl("Ct1_DBT_1", distal_reg_data2$file)),1],
+                               Ctrl1_rep1=distal_reg_data2[which(grepl("Ct1_DBT_1", distal_reg_data2$file)), 2], 
+                               Ctrl1_rep2=distal_reg_data2[which(grepl("Ct1_DBT_2", distal_reg_data2$file)), 2],
+                               Ctrl2_rep1=distal_reg_data2[which(grepl("Ct2_DBT_1", distal_reg_data2$file)), 2],
+                               Ctrl2_rep2=distal_reg_data2[which(grepl("Ct2_DBT_2", distal_reg_data2$file)), 2],
+                               Pat1_rep1=distal_reg_data2[which(grepl("Pt1_DBT_1", distal_reg_data2$file)), 2],
+                               Pat1_rep2=distal_reg_data2[which(grepl("Pt1_DBT_2", distal_reg_data2$file)), 2],
+                               Pat2_rep1=distal_reg_data2[which(grepl("Pt2_DBT_1", distal_reg_data2$file)), 2],
+                               Pat2_rep2=distal_reg_data2[which(grepl("Pt2_DBT_2", distal_reg_data2$file)),2]
+)
+
+write.table(df_distal_reg_data2, file = "DBT_distal_reg2.txt", append = FALSE, quote = FALSE, sep = "\t",
+            row.names = FALSE,
+            col.names = TRUE)
+#
+distal_reg_data3=df[which(df$end> 100259335 & df$end< 100298553),]
+
+df_distal_reg_data3=data.frame(Coord=distal_reg_data3[which(grepl("Ct1_DBT_1", distal_reg_data3$file)),1],
+                               Ctrl1_rep1=distal_reg_data3[which(grepl("Ct1_DBT_1", distal_reg_data3$file)), 2], 
+                               Ctrl1_rep2=distal_reg_data3[which(grepl("Ct1_DBT_2", distal_reg_data3$file)), 2],
+                               Ctrl2_rep1=distal_reg_data3[which(grepl("Ct2_DBT_1", distal_reg_data3$file)), 2],
+                               Ctrl2_rep2=distal_reg_data3[which(grepl("Ct2_DBT_2", distal_reg_data3$file)), 2],
+                               Pat1_rep1=distal_reg_data3[which(grepl("Pt1_DBT_1", distal_reg_data3$file)), 2],
+                               Pat1_rep2=distal_reg_data3[which(grepl("Pt1_DBT_2", distal_reg_data3$file)), 2],
+                               Pat2_rep1=distal_reg_data3[which(grepl("Pt2_DBT_1", distal_reg_data3$file)), 2],
+                               Pat2_rep2=distal_reg_data3[which(grepl("Pt2_DBT_2", distal_reg_data3$file)),2]
+)
+
+write.table(df_distal_reg_data3, file = "DBT_distal_reg3.txt", append = FALSE, quote = FALSE, sep = "\t",
+            row.names = FALSE,
+            col.names = TRUE)
+
+#
+distal_reg_data4=df[which(df$end> 100337197 & df$end< 100372674),]
+
+df_distal_reg_data4=data.frame(Coord=distal_reg_data4[which(grepl("Ct1_DBT_1", distal_reg_data4$file)),1],
+                               Ctrl1_rep1=distal_reg_data4[which(grepl("Ct1_DBT_1", distal_reg_data4$file)), 2], 
+                               Ctrl1_rep2=distal_reg_data4[which(grepl("Ct1_DBT_2", distal_reg_data4$file)), 2],
+                               Ctrl2_rep1=distal_reg_data4[which(grepl("Ct2_DBT_1", distal_reg_data4$file)), 2],
+                               Ctrl2_rep2=distal_reg_data4[which(grepl("Ct2_DBT_2", distal_reg_data4$file)), 2],
+                               Pat1_rep1=distal_reg_data4[which(grepl("Pt1_DBT_1", distal_reg_data4$file)), 2],
+                               Pat1_rep2=distal_reg_data4[which(grepl("Pt1_DBT_2", distal_reg_data4$file)), 2],
+                               Pat2_rep1=distal_reg_data4[which(grepl("Pt2_DBT_1", distal_reg_data4$file)), 2],
+                               Pat2_rep2=distal_reg_data4[which(grepl("Pt2_DBT_2", distal_reg_data4$file)),2]
+)
+
+write.table(df_distal_reg_data4, file = "DBT_distal_reg4.txt", append = FALSE, quote = FALSE, sep = "\t",
+            row.names = FALSE,
+            col.names = TRUE)
+
+#
+distal_reg_data5=df[which(df$end> 100843237 & df$end< 100911206),]
+
+df_distal_reg_data5=data.frame(Coord=distal_reg_data5[which(grepl("Ct1_DBT_1", distal_reg_data5$file)),1],
+                               Ctrl1_rep1=distal_reg_data5[which(grepl("Ct1_DBT_1", distal_reg_data5$file)), 2], 
+                               Ctrl1_rep2=distal_reg_data5[which(grepl("Ct1_DBT_2", distal_reg_data5$file)), 2],
+                               Ctrl2_rep1=distal_reg_data5[which(grepl("Ct2_DBT_1", distal_reg_data5$file)), 2],
+                               Ctrl2_rep2=distal_reg_data5[which(grepl("Ct2_DBT_2", distal_reg_data5$file)), 2],
+                               Pat1_rep1=distal_reg_data5[which(grepl("Pt1_DBT_1", distal_reg_data5$file)), 2],
+                               Pat1_rep2=distal_reg_data5[which(grepl("Pt1_DBT_2", distal_reg_data5$file)), 2],
+                               Pat2_rep1=distal_reg_data5[which(grepl("Pt2_DBT_1", distal_reg_data5$file)), 2],
+                               Pat2_rep2=distal_reg_data5[which(grepl("Pt2_DBT_2", distal_reg_data5$file)),2]
+)
+
+write.table(df_distal_reg_data5, file = "DBT_distal_reg5.txt", append = FALSE, quote = FALSE, sep = "\t",
+            row.names = FALSE,
+            col.names = TRUE)
